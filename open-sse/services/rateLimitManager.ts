@@ -9,8 +9,8 @@
  */
 
 import Bottleneck from "bottleneck";
-import { parseRetryAfterFromBody, lockModel } from "./accountFallback.ts";
-import { getProviderCategory } from "../config/providerRegistry.ts";
+import { parseRetryAfterFromBody, lockModel, isModelLocked } from "./accountFallback.ts";
+import { getProviderCategory, isRateLimitPerModel } from "../config/providerRegistry.ts";
 import { DEFAULT_API_LIMITS } from "../config/constants.ts";
 import { getCodexRateLimitKey } from "../executors/codex.ts";
 
@@ -243,6 +243,16 @@ export async function withRateLimit(provider, connectionId, model, fn) {
     return fn();
   }
 
+  // For per-model providers, reject immediately if this specific model is locked
+  // rather than queuing behind the connection-level limiter.
+  if (model && isRateLimitPerModel(provider) && isModelLocked(provider, connectionId, model)) {
+    const err = new Error(`Model ${model} is rate-limited on ${provider}`) as Error & {
+      status?: number;
+    };
+    err.status = 429;
+    throw err;
+  }
+
   const limiter = getLimiter(provider, connectionId, model);
   return limiter.schedule(fn);
 }
@@ -347,8 +357,19 @@ export function updateFromHeaders(provider, connectionId, headers, status, model
   // Handle 429 — rate limited
   if (status === 429) {
     const retryAfterMs = parseResetTime(retryAfterStr) || 60000; // Default 60s
-    const counts = limiter.counts();
     const limiterKey = getLimiterKey(provider, connectionId, model);
+
+    // For per-model providers (e.g. Mistral, kilo-gateway), a 429 is model-specific.
+    // Only lock the model; leave the connection limiter alive for other models.
+    if (model && isRateLimitPerModel(provider)) {
+      lockModel(provider, connectionId, model, "rate_limit_exceeded", retryAfterMs);
+      console.log(
+        `🚫 [RATE-LIMIT] ${provider}:${connectionId.slice(0, 8)}:${model} — 429 received, model locked for ${Math.ceil(retryAfterMs / 1000)}s`
+      );
+      return;
+    }
+
+    const counts = limiter.counts();
     console.log(
       `🚫 [RATE-LIMIT] ${provider}:${connectionId.slice(0, 8)} — 429 received, pausing for ${Math.ceil(retryAfterMs / 1000)}s, dropping ${counts.QUEUED} queued request(s)`
     );
@@ -570,6 +591,15 @@ export function updateFromResponseBody(provider, connectionId, responseBody, sta
   const { retryAfterMs, reason } = parseRetryAfterFromBody(responseBody);
 
   if (retryAfterMs && retryAfterMs > 0) {
+    // For per-model providers, only lock the model — don't pause the connection limiter.
+    if (model && isRateLimitPerModel(provider)) {
+      lockModel(provider, connectionId, model, reason, retryAfterMs);
+      console.log(
+        `🚫 [RATE-LIMIT] ${provider}:${connectionId.slice(0, 8)}:${model} — body-parsed retry: ${Math.ceil(retryAfterMs / 1000)}s (${reason}), model locked`
+      );
+      return;
+    }
+
     const limiter = getLimiter(provider, connectionId, null);
     console.log(
       `🚫 [RATE-LIMIT] ${provider}:${connectionId.slice(0, 8)} — body-parsed retry: ${Math.ceil(retryAfterMs / 1000)}s (${reason})`

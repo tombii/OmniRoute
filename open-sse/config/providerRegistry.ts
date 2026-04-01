@@ -69,6 +69,12 @@ export interface RegistryEntry {
   passthroughModels?: boolean;
   /** Default context window for all models in this provider (can be overridden per-model) */
   defaultContextLength?: number;
+  /**
+   * When true, rate limits apply per-model rather than per-connection.
+   * Use for providers like Mistral where free-tier limits are per-model,
+   * so a 429 on one model should not block other models on the same connection.
+   */
+  rateLimitPerModel?: boolean;
 }
 
 interface LegacyProvider {
@@ -963,6 +969,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     baseUrl: "https://api.mistral.ai/v1/chat/completions",
     authType: "apikey",
     authHeader: "bearer",
+    rateLimitPerModel: true,
     models: [
       { id: "mistral-large-latest", name: "Mistral Large 3" },
       { id: "codestral-latest", name: "Codestral" },
@@ -1199,6 +1206,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
     alias: "kg",
     format: "openai",
     executor: "default",
+    rateLimitPerModel: true,
     baseUrl: "https://api.kilo.ai/api/gateway/chat/completions",
     modelsUrl: "https://api.kilo.ai/api/gateway/models",
     authType: "apikey",
@@ -1611,4 +1619,12 @@ export function getProviderCategory(provider: string): "oauth" | "apikey" {
   const entry = getRegistryEntry(provider);
   if (!entry) return "apikey"; // Safe default for unknown providers
   return entry.authType === "apikey" ? "apikey" : "oauth";
+}
+
+/**
+ * Whether a provider's rate limits are per-model rather than per-connection.
+ * When true, a 429 on one model should only lock that model, not the whole connection.
+ */
+export function isRateLimitPerModel(provider: string): boolean {
+  return getRegistryEntry(provider)?.rateLimitPerModel === true;
 }
